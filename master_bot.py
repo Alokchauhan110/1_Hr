@@ -4,11 +4,10 @@ import logging
 import random
 import re
 import time
-from datetime import datetime, timedelta
+from collections import defaultdict
 
 import requests
 from telethon.sync import TelegramClient
-from telethon.tl.types import Dialog
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -33,6 +32,7 @@ ADMIN_USER_ID = 987654321          # Replace with your numerical Telegram User I
 SESSION_FILE = 'telegram_user.session'
 TASKS_FILE = 'tasks.json'
 POSTED_MESSAGES_FILE = 'posted_messages.json'
+MESSAGE_FETCH_LIMIT = 5000 # Safety limit for very large channels
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -43,11 +43,10 @@ logger = logging.getLogger(__name__)
 
 # --- Global Client and Task Variables ---
 telethon_client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
-running_tasks = {}  # Dictionary to hold the running asyncio task objects
+running_tasks = {}
 
 # --- Data Persistence Functions ---
 def load_data(filename):
-    """Loads JSON data from a file."""
     try:
         with open(filename, 'r') as f:
             return json.load(f)
@@ -55,13 +54,11 @@ def load_data(filename):
         return {}
 
 def save_data(filename, data):
-    """Saves Python dictionary to a JSON file."""
     with open(filename, 'w') as f:
         json.dump(data, f, indent=4)
 
 # --- Link Processing Logic ---
 def shorten_url(url):
-    """Converts a given URL to a TinyURL."""
     try:
         api_url = f'http://tinyurl.com/api-create.php?url={url}'
         response = requests.get(api_url)
@@ -70,10 +67,8 @@ def shorten_url(url):
         return url
 
 def process_links_in_text(text):
-    """Finds all Terabox links in text and replaces them with TinyURLs."""
     if not text:
         return text
-    # Regex to find all URLs
     urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text)
     for url in urls:
         if 'terabox' in url.lower():
@@ -86,51 +81,61 @@ async def forwarder_task(task_id, task_info):
     logger.info(f"Starting forwarder task '{task_id}'.")
     while task_id in running_tasks:
         try:
+            # 1. Fetch all messages and group them into posts (albums or single messages)
+            all_messages = await telethon_client.get_messages(task_info['source'], limit=MESSAGE_FETCH_LIMIT)
+            
+            posts = defaultdict(list)
+            for msg in reversed(all_messages): # Reverse to get messages in chronological order
+                if msg.grouped_id:
+                    posts[msg.grouped_id].append(msg)
+                elif msg.media or msg.text:
+                    posts[msg.id].append(msg)
+            
+            # 2. Determine which posts have not yet been sent
             posted_data = load_data(POSTED_MESSAGES_FILE)
-            task_posts = posted_data.get(task_id, {})
+            posted_post_ids = set(posted_data.get(task_id, []))
+            all_post_ids = set(posts.keys())
             
-            # Identify message IDs that have been posted in the last 30 days
-            thirty_days_ago = datetime.now() - timedelta(days=30)
-            recently_posted_ids = {
-                int(k) for k, v in task_posts.items() 
-                if datetime.fromisoformat(v) > thirty_days_ago
-            }
-            
-            # Fetch a list of recent messages from the source channel
-            all_messages = await telethon_client.get_messages(task_info['source'], limit=3000)
-            
-            # Filter out messages that were posted recently
-            unposted_messages = [
-                msg for msg in all_messages if msg and msg.id not in recently_posted_ids
-            ]
+            unposted_post_ids = list(all_post_ids - posted_post_ids)
 
-            if not unposted_messages:
-                logger.warning(f"Task '{task_id}': No new (unposted in last 30 days) messages found. Will try again later.")
+            # 3. If all posts have been sent, reset the cycle
+            if not unposted_post_ids:
+                logger.info(f"Task '{task_id}': All unique posts have been sent. Resetting the cycle.")
+                posted_post_ids.clear()
+                unposted_post_ids = list(all_post_ids)
+            
+            if not unposted_post_ids:
+                logger.warning(f"Task '{task_id}': Source channel appears to be empty. Will check again later.")
             else:
-                # Select a random message from the valid list
-                message_to_post = random.choice(unposted_messages)
+                # 4. Select a random post and prepare it for sending
+                post_id_to_send = random.choice(unposted_post_ids)
+                messages_in_post = posts[post_id_to_send]
                 
-                # Process text for Terabox links
-                processed_text = process_links_in_text(message_to_post.text)
+                # Extract media, caption, and buttons from the post
+                media_to_send = [msg.media for msg in messages_in_post if msg.media]
+                caption = next((msg.text for msg in messages_in_post if msg.text), None)
+                buttons = next((msg.buttons for msg in messages_in_post if msg.buttons), None)
                 
-                # Send a new message to the destination (avoids "forwarded from" tag)
-                await telethon_client.send_message(
+                processed_caption = process_links_in_text(caption)
+
+                # 5. Send the post (handles both single messages and albums)
+                await telethon_client.send_file(
                     task_info['destination'],
-                    message=processed_text,
-                    file=message_to_post.media,
-                    buttons=message_to_post.buttons
+                    file=media_to_send,
+                    caption=processed_caption,
+                    buttons=buttons
                 )
-                logger.info(f"Task '{task_id}': Posted message {message_to_post.id} to destination {task_info['destination']}.")
+                logger.info(f"Task '{task_id}': Posted post ID {post_id_to_send} to destination {task_info['destination']}.")
                 
-                # Log this message as posted
-                task_posts[str(message_to_post.id)] = datetime.now().isoformat()
-                posted_data[task_id] = task_posts
+                # 6. Log this post as sent
+                posted_post_ids.add(post_id_to_send)
+                posted_data[task_id] = list(posted_post_ids)
                 save_data(POSTED_MESSAGES_FILE, posted_data)
 
         except Exception as e:
             logger.error(f"Error in task '{task_id}': {e}", exc_info=True)
         
-        # Wait for the specified interval before the next post
+        # 7. Wait for the specified interval
         sleep_duration = int(task_info['gap_hours'] * 3600)
         await asyncio.sleep(sleep_duration)
 
@@ -159,7 +164,6 @@ async def list_channels_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     message = "Here are your available channels and their IDs:\n\n" + "\n".join(channel_list)
-    # Split the message into chunks if it's too long for a single Telegram message
     for x in range(0, len(message), 4096):
         await update.message.reply_text(message[x:x+4096], parse_mode='Markdown')
 
@@ -172,7 +176,6 @@ async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GET_SOURCE
 
 async def get_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles receiving the source channel ID."""
     try:
         context.user_data['source'] = int(update.message.text)
         await update.message.reply_text("Got it. Now, send me the Destination Channel ID.")
@@ -182,7 +185,6 @@ async def get_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return GET_SOURCE
 
 async def get_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles receiving the destination channel ID."""
     try:
         context.user_data['destination'] = int(update.message.text)
         await update.message.reply_text("Perfect. Finally, how many hours should I wait between posts? (e.g., 1, 6, 24)")
@@ -192,7 +194,6 @@ async def get_destination(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return GET_DEST
 
 async def get_gap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles receiving the posting interval and finalizes the task."""
     try:
         gap_hours = float(update.message.text)
         if gap_hours <= 0:
@@ -208,7 +209,6 @@ async def get_gap(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         save_data(TASKS_FILE, tasks)
         
-        # Start the new task in the background
         task = asyncio.create_task(forwarder_task(task_id, tasks[task_id]))
         running_tasks[task_id] = task
         
@@ -219,13 +219,11 @@ async def get_gap(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return GET_GAP
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancels the add task conversation."""
     await update.message.reply_text("Task creation cancelled.")
     return ConversationHandler.END
 
 # --- View and Delete Task Handlers ---
 async def list_tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays all currently configured tasks."""
     tasks = load_data(TASKS_FILE)
     if not tasks:
         await update.message.reply_text("There are no active tasks.")
@@ -240,7 +238,6 @@ async def list_tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(message, parse_mode='Markdown')
 
 async def delete_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shows a button menu of tasks to delete."""
     tasks = load_data(TASKS_FILE)
     if not tasks:
         await update.message.reply_text("There are no tasks to delete.")
@@ -250,43 +247,35 @@ async def delete_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("Select a task to delete:", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def delete_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the callback from the delete task button menu."""
     query = update.callback_query
     await query.answer()
     task_id = query.data.split('_')
 
     tasks = load_data(TASKS_FILE)
     if task_id in tasks:
-        # Remove task from saved data
         del tasks[task_id]
         save_data(TASKS_FILE, tasks)
         
-        # Stop the running asyncio task
         if task_id in running_tasks:
             running_tasks[task_id].cancel()
             del running_tasks[task_id]
         
         await query.edit_message_text(f"🗑️ Task '{task_id}' has been deleted.")
     else:
-        await query.edit_message_text(f"Task '{task_id}' not found (might have already been deleted).")
+        await query.edit_message_text(f"Task '{task_id}' not found.")
 
 # --- Main Application Logic ---
 async def main():
-    """The main function that connects clients and starts the bot."""
-    # Connect the Telethon client (user account)
     await telethon_client.start()
     logger.info("Telethon client started successfully.")
     
-    # Load saved tasks and start them
     tasks = load_data(TASKS_FILE)
     for task_id, info in tasks.items():
         task = asyncio.create_task(forwarder_task(task_id, info))
         running_tasks[task_id] = task
         
-    # Set up the control bot application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Conversation handler for adding a new task
     add_task_handler = ConversationHandler(
         entry_points=[CommandHandler('addtask', add_task_start, filters=admin_filter)],
         states={
@@ -297,7 +286,6 @@ async def main():
         fallbacks=[CommandHandler('cancel', cancel_conversation)],
     )
 
-    # Register all command and callback handlers
     application.add_handler(CommandHandler('start', start_command, filters=admin_filter))
     application.add_handler(CommandHandler('channels', list_channels_command, filters=admin_filter))
     application.add_handler(CommandHandler('tasks', list_tasks_command, filters=admin_filter))
@@ -305,14 +293,12 @@ async def main():
     application.add_handler(CallbackQueryHandler(delete_task_callback, pattern='^delete_'))
     application.add_handler(add_task_handler)
     
-    # Run the bot and client concurrently
     async with application:
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
         logger.info("Control bot started and is now polling for commands.")
         
-        # Keep the script alive until it's manually stopped
         await telethon_client.run_until_disconnected()
 
 if __name__ == '__main__':
